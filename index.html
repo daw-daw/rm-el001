@@ -2404,6 +2404,47 @@
                 </div>
             </div>
 
+            <!-- 云端同步面板 -->
+            <div class="panel">
+                <div class="panel-header">☁️ 云端同步 · GitHub 仓库存储（多设备互通）</div>
+                <div class="panel-body">
+                    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;line-height:1.6;">
+                        将存档保存到你的 GitHub 仓库中，手机、电脑随时同步，无需手动复制代码。首次使用需填写配置信息。
+                    </p>
+
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+                        <div>
+                            <label style="font-size:12px;font-weight:700;color:var(--rm-blue);display:block;margin-bottom:6px;">GitHub 用户名</label>
+                            <input type="text" id="cloudUser" class="round-input-cell" style="width:100%;height:36px;" placeholder="你的GitHub账号名">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:700;color:var(--rm-blue);display:block;margin-bottom:6px;">仓库名称</label>
+                            <input type="text" id="cloudRepo" class="round-input-cell" style="width:100%;height:36px;" placeholder="存放存档的仓库名">
+                        </div>
+                        <div style="grid-column:1 / -1;">
+                            <label style="font-size:12px;font-weight:700;color:var(--rm-blue);display:block;margin-bottom:6px;">Personal Access Token（个人令牌）</label>
+                            <input type="password" id="cloudToken" class="round-input-cell" style="width:100%;height:36px;" placeholder="拥有 repo 权限的经典令牌">
+                            <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;line-height:1.5;">
+                                生成路径：GitHub 右上角头像 → Settings → 左侧 Developer settings → Personal access tokens → Tokens (classic) → Generate new token，勾选 repo 全部权限
+                            </div>
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:700;color:var(--rm-blue);display:block;margin-bottom:6px;">存档文件名</label>
+                            <input type="text" id="cloudFileName" class="round-input-cell" style="width:100%;height:36px;" value="rm-el001-save.txt">
+                        </div>
+                        <div style="display:flex;align-items:flex-end;">
+                            <button class="btn btn-secondary" onclick="saveCloudConfig()" style="width:100%;">💾 保存配置</button>
+                        </div>
+                    </div>
+
+                    <div class="save-actions" style="justify-content:center;">
+                        <button class="btn btn-gold" onclick="uploadSaveToCloud()">⬆️ 上传存档到云端</button>
+                        <button class="btn btn-secondary" onclick="downloadSaveFromCloud()">⬇️ 从云端拉取存档</button>
+                    </div>
+                    <div class="status-tip" id="cloudStatusText" style="text-align:center;margin-top:12px;"></div>
+                </div>
+            </div>
+
             <div class="panel">
                 <div class="panel-header">存档导入 / 导出（支持iCloud多端同步）</div>
                 <div class="panel-body">
@@ -2611,6 +2652,7 @@
                 initSaveSystem();
                 initSeason();
                 initFormation();
+                loadCloudConfig(); // 自动加载云端同步配置
                 renderAllPages();
                 renderArchiveList();
                 updateSaveStatus();
@@ -3186,6 +3228,178 @@
                 alert(errMsg);
                 console.error('文本导入错误详情：', err);
             }
+        }
+
+        // ===================== 云端同步（GitHub 仓库存储）=====================
+        const CLOUD_CONFIG_KEY = 'rm_el001_cloud_config';
+
+        function saveCloudConfig() {
+            const config = {
+                user: document.getElementById('cloudUser').value.trim(),
+                repo: document.getElementById('cloudRepo').value.trim(),
+                token: document.getElementById('cloudToken').value.trim(),
+                fileName: document.getElementById('cloudFileName').value.trim() || 'rm-el001-save.txt'
+            };
+
+            if (!config.user || !config.repo || !config.token) {
+                showCloudStatus('请填写完整的用户名、仓库名和令牌', 'error');
+                return;
+            }
+
+            localStorage.setItem(CLOUD_CONFIG_KEY, JSON.stringify(config));
+            showCloudStatus('✅ 配置已保存，下次无需重复填写', 'success');
+        }
+
+        function loadCloudConfig() {
+            const raw = localStorage.getItem(CLOUD_CONFIG_KEY);
+            if (!raw) return null;
+            try {
+                const config = JSON.parse(raw);
+                document.getElementById('cloudUser').value = config.user || '';
+                document.getElementById('cloudRepo').value = config.repo || '';
+                document.getElementById('cloudToken').value = config.token || '';
+                document.getElementById('cloudFileName').value = config.fileName || 'rm-el001-save.txt';
+                return config;
+            } catch(e) {
+                return null;
+            }
+        }
+
+        async function uploadSaveToCloud() {
+            const config = loadCloudConfig();
+            if (!config) {
+                showCloudStatus('请先填写并保存云端配置', 'error');
+                return;
+            }
+            if (!seasonData) {
+                showCloudStatus('暂无存档可上传', 'error');
+                return;
+            }
+
+            showCloudStatus('正在上传存档到 GitHub...', 'warning');
+
+            try {
+                // 生成标准格式存档
+                const exportData = {
+                    version: SAVE_VERSION,
+                    exportTime: new Date().toISOString(),
+                    data: seasonData
+                };
+                const jsonStr = JSON.stringify(exportData);
+                const bytes = new TextEncoder().encode(jsonStr);
+                let binary = '';
+                for (let i = 0; i < bytes.byteLength; i++) {
+                    binary += String.fromCharCode(bytes[i]);
+                }
+                const contentBase64 = btoa(binary);
+
+                const apiUrl = `https://api.github.com/repos/${config.user}/${config.repo}/contents/${config.fileName}`;
+
+                // 先获取文件 SHA（已存在则更新，不存在则新建）
+                let fileSha = null;
+                try {
+                    const getResp = await fetch(apiUrl, {
+                        headers: { 'Authorization': `token ${config.token}` }
+                    });
+                    if (getResp.ok) {
+                        const fileData = await getResp.json();
+                        fileSha = fileData.sha;
+                    }
+                } catch(e) {
+                    // 文件不存在属于正常情况，继续新建
+                }
+
+                const requestBody = {
+                    message: `更新游戏存档 - ${new Date().toLocaleString('zh-CN')}`,
+                    content: contentBase64
+                };
+                if (fileSha) requestBody.sha = fileSha;
+
+                const resp = await fetch(apiUrl, {
+                    method: 'PUT',
+                    headers: {
+                        'Authorization': `token ${config.token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(requestBody)
+                });
+
+                if (resp.ok) {
+                    showCloudStatus('✅ 存档上传成功，其他设备可拉取同步', 'success');
+                } else {
+                    const errInfo = await resp.json();
+                    throw new Error(errInfo.message || '上传请求失败，请检查令牌权限');
+                }
+            } catch(e) {
+                showCloudStatus('上传失败：' + e.message, 'error');
+                console.error('云端上传错误详情:', e);
+            }
+        }
+
+        async function downloadSaveFromCloud() {
+            const config = loadCloudConfig();
+            if (!config) {
+                showCloudStatus('请先填写并保存云端配置', 'error');
+                return;
+            }
+
+            if (!confirm('拉取云端存档将完全覆盖当前本地数据，确定继续吗？')) return;
+
+            showCloudStatus('正在从 GitHub 拉取存档...', 'warning');
+
+            try {
+                const apiUrl = `https://api.github.com/repos/${config.user}/${config.repo}/contents/${config.fileName}`;
+                const resp = await fetch(apiUrl, {
+                    headers: { 'Authorization': `token ${config.token}` }
+                });
+
+                if (!resp.ok) {
+                    if (resp.status === 404) throw new Error('云端不存在存档文件，请先在另一设备上传');
+                    throw new Error('拉取失败，请检查用户名、仓库名和令牌是否正确');
+                }
+
+                const fileData = await resp.json();
+                const contentBase64 = fileData.content.replace(/\s/g, '');
+                
+                // Base64 解码为原始 JSON
+                const binary = atob(contentBase64);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+                const jsonStr = new TextDecoder('utf-8').decode(bytes);
+                const importObj = JSON.parse(jsonStr);
+                const data = importObj.data || importObj;
+
+                if (!validateSaveData(JSON.stringify(data))) {
+                    throw new Error('云端存档数据损坏，格式不兼容');
+                }
+
+                // 先备份本地存档再覆盖
+                safeSave();
+                seasonData = data;
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(seasonData));
+                renderAllPages();
+                updateSaveStatus();
+                renderArchiveList();
+
+                showCloudStatus('✅ 云端存档拉取成功，数据已全部更新', 'success');
+                alert('云端存档导入成功！');
+                setTimeout(() => switchPage('home'), 800);
+
+            } catch(e) {
+                showCloudStatus('拉取失败：' + e.message, 'error');
+                alert('拉取失败：' + e.message);
+                console.error('云端拉取错误详情:', e);
+            }
+        }
+
+        function showCloudStatus(text, type) {
+            const el = document.getElementById('cloudStatusText');
+            if (!el) return;
+            el.textContent = text;
+            el.className = 'status-tip status-' + type;
+            setTimeout(() => el.textContent = '', 6000);
         }
 
         function renderAllPages() {
