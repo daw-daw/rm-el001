@@ -2741,6 +2741,20 @@
 
                 localStorage.setItem(STORAGE_KEY, newData);
                 updateSaveStatus();
+
+                // ===== 新增：自动云端同步（静默模式）=====
+                try {
+                    const cloudConfig = localStorage.getItem(CLOUD_CONFIG_KEY);
+                    if (cloudConfig) {
+                        // 异步后台上传，不阻塞本地保存
+                        uploadSaveToCloud(true);
+                    }
+                } catch(e) {
+                    // 云端上传失败不影响本地保存，仅控制台输出
+                    console.warn('自动云端上传触发失败:', e);
+                }
+                // =========================================
+
                 return true;
             } catch(e) {
                 console.error('保存失败:', e);
@@ -3265,18 +3279,18 @@
             }
         }
 
-        async function uploadSaveToCloud() {
+        async function uploadSaveToCloud(silent = false) {
             const config = loadCloudConfig();
             if (!config) {
-                showCloudStatus('请先填写并保存云端配置', 'error');
+                if (!silent) showCloudStatus('请先填写并保存云端配置', 'error');
                 return;
             }
             if (!seasonData) {
-                showCloudStatus('暂无存档可上传', 'error');
+                if (!silent) showCloudStatus('暂无存档可上传', 'error');
                 return;
             }
 
-            showCloudStatus('正在上传存档到 GitHub...', 'warning');
+            if (!silent) showCloudStatus('正在上传存档到 GitHub...', 'warning');
 
             try {
                 // 生成标准格式存档
@@ -3325,13 +3339,14 @@
                 });
 
                 if (resp.ok) {
-                    showCloudStatus('✅ 存档上传成功，其他设备可拉取同步', 'success');
+                    if (!silent) showCloudStatus('✅ 存档上传成功，其他设备可拉取同步', 'success');
                 } else {
                     const errInfo = await resp.json();
                     throw new Error(errInfo.message || '上传请求失败，请检查令牌权限');
                 }
             } catch(e) {
-                showCloudStatus('上传失败：' + e.message, 'error');
+                // 上传失败无论是否静默都提示，方便排查问题
+                showCloudStatus('自动上传失败：' + e.message, 'error');
                 console.error('云端上传错误详情:', e);
             }
         }
