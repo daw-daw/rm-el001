@@ -3,6 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>EL-001赛季 | 皇家马德里荣耀征程</title>
     <style>
         * {
@@ -2657,6 +2660,19 @@
                 renderArchiveList();
                 updateSaveStatus();
 
+                // ===== 新增：页面加载自动同步云端存档（后台静默执行）=====
+                try {
+                    const cloudConfig = localStorage.getItem(CLOUD_CONFIG_KEY);
+                    if (cloudConfig) {
+                        // 延迟1秒执行，不阻塞首屏渲染
+                        setTimeout(() => {
+                            autoSyncFromCloud();
+                        }, 1000);
+                    }
+                } catch(e) {
+                    console.warn('自动云端同步初始化失败:', e);
+                }
+
                 // 检测未完成的比赛草稿，询问是否恢复
                 const draft = loadMatchDraft();
                 if (draft && confirm('检测到上一场未完成的比赛，是否继续？')) {
@@ -3406,6 +3422,55 @@
                 showCloudStatus('拉取失败：' + e.message, 'error');
                 alert('拉取失败：' + e.message);
                 console.error('云端拉取错误详情:', e);
+            }
+        }
+
+        // 页面加载自动静默同步云端存档
+        async function autoSyncFromCloud() {
+            const config = loadCloudConfig();
+            if (!config) return;
+
+            try {
+                const apiUrl = `https://api.github.com/repos/${config.user}/${config.repo}/contents/${config.fileName}`;
+                const resp = await fetch(apiUrl, {
+                    headers: { 'Authorization': `token ${config.token}` },
+                    cache: 'no-store' // 强制不走缓存，确保拿到最新版本
+                });
+
+                if (!resp.ok) return; // 云端无文件或请求失败，静默退出不打扰用户
+
+                const fileData = await resp.json();
+                // 对比云端与本地的更新时间，仅云端更新时才覆盖
+                const cloudTime = new Date(fileData.commit?.committer?.date || 0).getTime();
+                const localTime = new Date(seasonData?.lastSaveTime || 0).getTime();
+                
+                if (cloudTime <= localTime) return; // 本地不比云端旧，不同步
+
+                // 解码云端存档
+                const contentBase64 = fileData.content.replace(/\s/g, '');
+                const binary = atob(contentBase64);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+                const jsonStr = new TextDecoder('utf-8').decode(bytes);
+                const importObj = JSON.parse(jsonStr);
+                const data = importObj.data || importObj;
+
+                if (!validateSaveData(JSON.stringify(data))) return;
+
+                // 先备份本地再覆盖，避免意外丢失
+                safeSave();
+                seasonData = data;
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(seasonData));
+                renderAllPages();
+                updateSaveStatus();
+                renderArchiveList();
+
+                console.log('云端存档自动同步完成');
+            } catch(e) {
+                // 自动同步失败不弹窗，仅控制台输出，不干扰正常使用
+                console.warn('自动云端同步失败:', e);
             }
         }
 
