@@ -2660,14 +2660,32 @@
                 renderArchiveList();
                 updateSaveStatus();
 
-                // ===== 新增：页面加载自动同步云端存档（后台静默执行）=====
+                // ===== 页面加载自动同步云端存档 + 检测比赛草稿 =====
                 try {
                     const cloudConfig = localStorage.getItem(CLOUD_CONFIG_KEY);
                     if (cloudConfig) {
-                        // 延迟1秒执行，不阻塞首屏渲染
-                        setTimeout(() => {
-                            autoSyncFromCloud();
-                        }, 1000);
+                        // 延迟1.5秒执行，不阻塞首屏渲染
+                        setTimeout(async () => {
+                            await autoSyncFromCloud();
+                            // 主存档同步完成后，检测云端草稿
+                            const cloudDraft = await downloadMatchDraftFromCloud();
+                            const localDraft = loadMatchDraft();
+                            
+                            if (cloudDraft && !localDraft) {
+                                if (confirm('检测到云端有未完成的比赛，是否加载继续？')) {
+                                    localStorage.setItem(MATCH_DRAFT_KEY, JSON.stringify(cloudDraft));
+                                    restoreMatchDraft(cloudDraft);
+                                }
+                            } else if (cloudDraft && localDraft) {
+                                // 两端都有草稿，取更新的那个
+                                const cloudTime = cloudDraft.saveTime || 0;
+                                const localTime = localDraft.saveTime || 0;
+                                if (cloudTime > localTime && confirm('检测到云端有更新的比赛进度，是否加载云端版本？')) {
+                                    localStorage.setItem(MATCH_DRAFT_KEY, JSON.stringify(cloudDraft));
+                                    restoreMatchDraft(cloudDraft);
+                                }
+                            }
+                        }, 1500);
                     }
                 } catch(e) {
                     console.warn('自动云端同步初始化失败:', e);
@@ -3262,6 +3280,137 @@
 
         // ===================== 云端同步（GitHub 仓库存储）=====================
         const CLOUD_CONFIG_KEY = 'rm_el001_cloud_config';
+        const DRAFT_FILE_NAME = 'rm-el001-match-draft.txt';
+
+        // 上传比赛草稿到云端
+        async function uploadMatchDraftToCloud(silent = false) {
+            const config = loadCloudConfig();
+            if (!config) {
+                if (!silent) showCloudStatus('请先填写并保存云端配置', 'error');
+                return false;
+            }
+            const draftRaw = localStorage.getItem(MATCH_DRAFT_KEY);
+            if (!draftRaw) {
+                if (!silent) showCloudStatus('没有可上传的比赛草稿', 'warning');
+                return false;
+            }
+
+            try {
+                const bytes = new TextEncoder().encode(draftRaw);
+                let binary = '';
+                for (let i = 0; i < bytes.byteLength; i++) {
+                    binary += String.fromCharCode(bytes[i]);
+                }
+                const contentBase64 = btoa(binary);
+
+                const apiUrl = `https://api.github.com/repos/${config.user}/${config.repo}/contents/${DRAFT_FILE_NAME}`;
+                let fileSha = null;
+                try {
+                    const getResp = await fetch(apiUrl, {
+                        headers: { 'Authorization': `token ${config.token}` },
+                        cache: 'no-store'
+                    });
+                    if (getResp.ok) {
+                        const fileData = await getResp.json();
+                        fileSha = fileData.sha;
+                    }
+                } catch(e) {}
+
+                const requestBody = {
+                    message: `更新比赛草稿 - ${new Date().toLocaleString('zh-CN')}`,
+                    content: contentBase64
+                };
+                if (fileSha) requestBody.sha = fileSha;
+
+                const resp = await fetch(apiUrl, {
+                    method: 'PUT',
+                    headers: {
+                        'Authorization': `token ${config.token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(requestBody)
+                });
+
+                if (resp.ok) {
+                    if (!silent) showCloudStatus('✅ 比赛草稿已同步到云端', 'success');
+                    return true;
+                } else {
+                    const errInfo = await resp.json();
+                    throw new Error(errInfo.message || '草稿上传失败');
+                }
+            } catch(e) {
+                if (!silent) showCloudStatus('草稿上传失败：' + e.message, 'error');
+                console.warn('云端草稿上传失败:', e);
+                return false;
+            }
+        }
+
+        // 从云端拉取比赛草稿
+        async function downloadMatchDraftFromCloud() {
+            const config = loadCloudConfig();
+            if (!config) return null;
+
+            try {
+                const apiUrl = `https://api.github.com/repos/${config.user}/${config.repo}/contents/${DRAFT_FILE_NAME}`;
+                const resp = await fetch(apiUrl, {
+                    headers: { 'Authorization': `token ${config.token}` },
+                    cache: 'no-store'
+                });
+
+                if (!resp.ok) return null;
+                const fileData = await resp.json();
+                const contentBase64 = fileData.content.replace(/\s/g, '');
+                
+                const binary = atob(contentBase64);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+                const jsonStr = new TextDecoder('utf-8').decode(bytes);
+                const draft = JSON.parse(jsonStr);
+
+                // 校验草稿有效性：对应赛程必须存在
+                const fixtureExists = seasonData.fixtures.some(f => f.id === draft.fixtureId);
+                if (!fixtureExists) throw new Error('草稿对应比赛不存在，版本不匹配');
+                return draft;
+            } catch(e) {
+                console.warn('云端草稿拉取失败:', e);
+                return null;
+            }
+        }
+
+        // 删除云端比赛草稿
+        async function deleteMatchDraftFromCloud(silent = true) {
+            const config = loadCloudConfig();
+            if (!config) return false;
+
+            try {
+                const apiUrl = `https://api.github.com/repos/${config.user}/${config.repo}/contents/${DRAFT_FILE_NAME}`;
+                const getResp = await fetch(apiUrl, {
+                    headers: { 'Authorization': `token ${config.token}` },
+                    cache: 'no-store'
+                });
+                if (!getResp.ok) return true; // 文件不存在，视为已删除
+
+                const fileData = await getResp.json();
+                const resp = await fetch(apiUrl, {
+                    method: 'DELETE',
+                    headers: {
+                        'Authorization': `token ${config.token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        message: '清理已完成的比赛草稿',
+                        sha: fileData.sha
+                    })
+                });
+
+                return resp.ok;
+            } catch(e) {
+                if (!silent) console.warn('云端草稿删除失败:', e);
+                return false;
+            }
+        }
 
         function saveCloudConfig() {
             const config = {
@@ -3329,7 +3478,8 @@
                 let fileSha = null;
                 try {
                     const getResp = await fetch(apiUrl, {
-                        headers: { 'Authorization': `token ${config.token}` }
+                        headers: { 'Authorization': `token ${config.token}` },
+                        cache: 'no-store'
                     });
                     if (getResp.ok) {
                         const fileData = await getResp.json();
@@ -3381,7 +3531,8 @@
             try {
                 const apiUrl = `https://api.github.com/repos/${config.user}/${config.repo}/contents/${config.fileName}`;
                 const resp = await fetch(apiUrl, {
-                    headers: { 'Authorization': `token ${config.token}` }
+                    headers: { 'Authorization': `token ${config.token}` },
+                    cache: 'no-store'
                 });
 
                 if (!resp.ok) {
@@ -4314,9 +4465,16 @@
                     oppShots: matchState.oppShots,
                     oppShotsOnTarget: matchState.oppShotsOnTarget,
                     oppCorners: matchState.oppCorners
-                }
+                },
+                saveTime: Date.now()
             };
             localStorage.setItem(MATCH_DRAFT_KEY, JSON.stringify(draft));
+
+            // 自动静默上传云端，失败不影响本地进度
+            try {
+                const cloudConfig = localStorage.getItem(CLOUD_CONFIG_KEY);
+                if (cloudConfig) uploadMatchDraftToCloud(true);
+            } catch(e) {}
         }
 
         function loadMatchDraft() {
@@ -4331,6 +4489,11 @@
 
         function clearMatchDraft() {
             localStorage.removeItem(MATCH_DRAFT_KEY);
+            // 同步删除云端草稿
+            try {
+                const cloudConfig = localStorage.getItem(CLOUD_CONFIG_KEY);
+                if (cloudConfig) deleteMatchDraftFromCloud(true);
+            } catch(e) {}
         }
 
         function manualSaveDraft() {
@@ -4339,15 +4502,27 @@
                 return;
             }
             saveMatchDraft();
-            // 按钮反馈动画
+            
             const btn = document.getElementById('saveDraftBtn');
             const originalText = btn.textContent;
-            btn.textContent = '✅ 已保存进度';
+            btn.textContent = '⏳ 同步中...';
             btn.disabled = true;
-            setTimeout(() => {
-                btn.textContent = originalText;
-                btn.disabled = false;
-            }, 1500);
+
+            // 等待云端上传完成后更新按钮状态
+            setTimeout(async () => {
+                const cloudConfig = localStorage.getItem(CLOUD_CONFIG_KEY);
+                if (cloudConfig) {
+                    const ok = await uploadMatchDraftToCloud(false);
+                    btn.textContent = ok ? '✅ 已同步到云端' : '⚠️ 本地已保存';
+                } else {
+                    btn.textContent = '✅ 本地已保存';
+                }
+                
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.disabled = false;
+                }, 1500);
+            }, 300);
         }
 
         function restoreMatchDraft(draft) {
