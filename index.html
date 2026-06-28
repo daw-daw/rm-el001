@@ -2655,102 +2655,90 @@
         // 草稿同步状态：idle 空闲 / uploading 上传中 / success 成功 / error 失败
         let draftSyncStatus = 'idle';
 
-        // ===================== 初始化 =====================
-        document.addEventListener('DOMContentLoaded', function() {
-            try {
-                initSaveSystem();
-                initSeason();
-                initFormation();
-                loadCloudConfig(); // 自动加载云端同步配置
-                renderAllPages();
-                renderArchiveList();
-                updateSaveStatus();
+        // ========== 统一初始化：主存档同步 + 草稿检测，全程只弹一次确认 ==========
+        async function initCloudAndDraft() {
+            const hasCloudConfig = !!localStorage.getItem(CLOUD_CONFIG_KEY);
+            const localDraft = loadMatchDraft();
+            let cloudDraft = null;
 
-                // ===== 页面加载：先同步云端主存档，再统一检测草稿（本地+云端）=====
+            // 有云端配置则先同步主存档、拉取云端草稿
+            if (hasCloudConfig) {
                 try {
-                    const cloudConfig = localStorage.getItem(CLOUD_CONFIG_KEY);
-                    if (cloudConfig) {
-                        // 延迟1.2秒执行，不阻塞首屏渲染
-                        setTimeout(async () => {
-                            await autoSyncFromCloud();
-                            // 主存档同步完成后，拉取云端草稿
-                            const cloudDraft = await downloadMatchDraftFromCloud();
-                            const localDraft = loadMatchDraft();
-                            
-                            let finalDraft = null;
-                            let tipText = '';
-                            
-                            if (cloudDraft && localDraft) {
-                                // 两端都有，取时间更新的
-                                const cloudTime = cloudDraft.saveTime || 0;
-                                const localTime = localDraft.saveTime || 0;
-                                if (cloudTime > localTime) {
-                                    finalDraft = cloudDraft;
-                                    tipText = '检测到云端有更新的比赛进度，是否加载继续？';
-                                } else {
-                                    finalDraft = localDraft;
-                                    tipText = '检测到本地有未完成的比赛，是否继续？';
-                                }
-                            } else if (cloudDraft) {
-                                finalDraft = cloudDraft;
-                                tipText = '检测到云端有未完成的比赛，是否加载继续？';
-                            } else if (localDraft) {
-                                finalDraft = localDraft;
-                                tipText = '检测到本地有未完成的比赛，是否继续？';
-                            }
-                            
-                            if (finalDraft && confirm(tipText)) {
-                                localStorage.setItem(MATCH_DRAFT_KEY, JSON.stringify(finalDraft));
-                                restoreMatchDraft(finalDraft);
-                            }
-                        }, 1200);
-                    } else {
-                        // 无云端配置，只检查本地草稿
-                        const draft = loadMatchDraft();
-                        if (draft && confirm('检测到上一场未完成的比赛，是否继续？')) {
-                            restoreMatchDraft(draft);
-                        }
-                    }
-                } catch(e) {
-                    console.warn('自动同步初始化失败:', e);
-                    // 异常降级：只检查本地草稿
-                    const draft = loadMatchDraft();
-                    if (draft && confirm('检测到上一场未完成的比赛，是否继续？')) {
-                        restoreMatchDraft(draft);
-                    }
-                }
-            } catch(e) {
-                console.error('初始化异常，尝试恢复备份:', e);
-                try {
-                    restoreFromBackup();
-                    initSeason();
-                    initFormation();
-                    renderAllPages();
-                    renderArchiveList();
-                    updateSaveStatus();
-                } catch(e2) {
-                    console.error('备份恢复失败，重建赛季:', e2);
-                    localStorage.removeItem(STORAGE_KEY);
-                    localStorage.removeItem(BACKUP_KEY);
-                    seasonData = null;
-                    initSeason();
-                    initFormation();
-                    renderAllPages();
-                    renderArchiveList();
-                    updateSaveStatus();
+                    await autoSyncFromCloud();
+                    cloudDraft = await downloadMatchDraftFromCloud();
+                } catch (e) {
+                    console.warn('云端同步失败，仅使用本地数据:', e);
                 }
             }
 
-            document.addEventListener('click', function(e) {
-                if (!e.target.closest('.player-slot') && activePicker) {
-                    activePicker.classList.remove('show');
-                    activePicker = null;
-                }
-            });
+            // 两端都无草稿，直接退出
+            if (!localDraft && !cloudDraft) return;
 
-            window.addEventListener('beforeunload', function() {
-                if (AUTO_SAVE && seasonData) safeSave();
-            });
+            // 唯一判断标准：保存时间戳，谁更新用谁，不偏向任何一端
+            let latestDraft = localDraft;
+            let sourceText = '本地';
+            const localTime = localDraft?.saveTime || 0;
+            const cloudTime = cloudDraft?.saveTime || 0;
+
+            if (cloudDraft && cloudTime > localTime) {
+                latestDraft = cloudDraft;
+                sourceText = '云端（更新）';
+            } else if (localDraft) {
+                sourceText = localTime > 0 ? '本地（更新）' : '本地';
+            }
+
+            // 校验比赛有效性
+            const fixtureValid = seasonData.fixtures.some(f => f.id === latestDraft.fixtureId);
+            if (!fixtureValid) {
+                clearMatchDraft();
+                return;
+            }
+
+            const timeStr = latestDraft.saveTime 
+                ? new Date(latestDraft.saveTime).toLocaleString('zh-CN') 
+                : '未知时间';
+
+            if (confirm(`检测到${sourceText}的未完成比赛\n保存时间：${timeStr}\n是否加载继续？`)) {
+                // 加载非本地版本前，自动备份本地草稿，防止误覆盖
+                if (localDraft && latestDraft !== localDraft) {
+                    localStorage.setItem(MATCH_DRAFT_KEY + '_backup', JSON.stringify(localDraft));
+                }
+                localStorage.setItem(MATCH_DRAFT_KEY, JSON.stringify(latestDraft));
+                restoreMatchDraft(latestDraft);
+            }
+        }
+
+        // 延迟1秒执行，不阻塞首屏渲染
+        setTimeout(initCloudAndDraft, 1000);
+
+        // 页面切回前台时自动检查云端更新，切换设备无需手动刷新
+        document.addEventListener('visibilitychange', async () => {
+            if (document.visibilityState !== 'visible') return;
+            if (!localStorage.getItem(CLOUD_CONFIG_KEY)) return;
+            if (currentMatch) return; // 比赛进行中不打断操作
+
+            try {
+                const cloudDraft = await downloadMatchDraftFromCloud();
+                const localDraft = loadMatchDraft();
+                if (!cloudDraft) return;
+
+                const cloudTime = cloudDraft.saveTime || 0;
+                const localTime = localDraft?.saveTime || 0;
+
+                // 仅云端版本更新时才弹窗提示
+                if (cloudTime > localTime) {
+                    const timeStr = new Date(cloudTime).toLocaleString('zh-CN');
+                    if (confirm(`检测到云端有更新的比赛进度\n更新时间：${timeStr}\n是否加载？`)) {
+                        if (localDraft) {
+                            localStorage.setItem(MATCH_DRAFT_KEY + '_backup', JSON.stringify(localDraft));
+                        }
+                        localStorage.setItem(MATCH_DRAFT_KEY, JSON.stringify(cloudDraft));
+                        restoreMatchDraft(cloudDraft);
+                    }
+                }
+            } catch (e) {
+                console.warn('前台同步草稿失败:', e);
+            }
         });
 
         // ===================== 存档安全系统 =====================
@@ -3396,33 +3384,42 @@
 
         // 从云端拉取比赛草稿
         async function downloadMatchDraftFromCloud() {
-            const config = loadCloudConfig();
-            if (!config) return null;
+            const configRaw = localStorage.getItem(CLOUD_CONFIG_KEY);
+            if (!configRaw) return null;
+            let config;
+            try {
+                config = JSON.parse(configRaw);
+            } catch (e) {
+                return null;
+            }
 
             try {
-                const apiUrl = `https://api.github.com/repos/${config.user}/${config.repo}/contents/${DRAFT_FILE_NAME}`;
+                // 三重保障绕过缓存：时间戳参数 + raw格式 + 强制无缓存头
+                const timestamp = Date.now();
+                const apiUrl = `https://api.github.com/repos/${config.user}/${config.repo}/contents/${DRAFT_FILE_NAME}?t=${timestamp}`;
+                
                 const resp = await fetch(apiUrl, {
-                    headers: { 'Authorization': `token ${config.token}` },
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `token ${config.token}`,
+                        'Accept': 'application/vnd.github.v3.raw',
+                        'Cache-Control': 'no-cache, no-store, must-revalidate'
+                    },
                     cache: 'no-store'
                 });
 
                 if (!resp.ok) return null;
-                const fileData = await resp.json();
-                const contentBase64 = fileData.content.replace(/\s/g, '');
-                
-                const binary = atob(contentBase64);
-                const bytes = new Uint8Array(binary.length);
-                for (let i = 0; i < binary.length; i++) {
-                    bytes[i] = binary.charCodeAt(i);
-                }
-                const jsonStr = new TextDecoder('utf-8').decode(bytes);
+
+                // 直接读取原始文本，跳过base64解析，速度更快更稳定
+                const jsonStr = await resp.text();
                 const draft = JSON.parse(jsonStr);
 
-                // 校验草稿有效性：对应赛程必须存在
-                const fixtureExists = seasonData.fixtures.some(f => f.id === draft.fixtureId);
-                if (!fixtureExists) throw new Error('草稿对应比赛不存在，版本不匹配');
+                // 严格有效性校验
+                if (!draft?.fixtureId || !Array.isArray(draft?.matchState?.logs)) return null;
+                if (!seasonData.fixtures.some(f => f.id === draft.fixtureId)) return null;
+
                 return draft;
-            } catch(e) {
+            } catch (e) {
                 console.warn('云端草稿拉取失败:', e);
                 return null;
             }
@@ -4346,90 +4343,10 @@
                 if (existingDraft && existingDraft.fixtureId === f.id) {
                     // 检测到同一场比赛的未完成进度，询问是否恢复
                     if (confirm('检测到本场比赛的未完成进度，是否继续？')) {
-                        currentMatch = f;
-                        isHome = f.isRmHome;
-                        isNeutral = f.neutral || false;
-
-                        // 应用主客场主题
-                        document.body.classList.remove('away-match', 'neutral-match');
-                        if (isNeutral) document.body.classList.add('neutral-match');
-                        else if (!isHome) document.body.classList.add('away-match');
-
-                        // 恢复比赛状态
-                        matchState = {
-                            ...existingDraft.matchState,
-                            isReplaying: false,
-                            replayTimer: null,
-                            replayIndex: 0
-                        };
-
-                        // 更新头部信息
-                        document.getElementById('matchPageTitle').textContent = `${f.typeName} · ${f.round}${isNeutral ? ' · 中立场地' : ''}`;
-                        document.getElementById('matchTypeBadge').textContent = f.typeName;
-                        const badge = document.getElementById('homeAwayBadge');
-                        if (isNeutral) {
-                            badge.textContent = '中立场地';
-                            badge.className = 'home-away-badge badge-neutral';
-                        } else {
-                            badge.textContent = isHome ? '主场作战' : '客场作战';
-                            badge.className = `home-away-badge ${isHome ? 'badge-home' : 'badge-away'}`;
-                        }
-                        document.getElementById('homeTeamName').textContent = f.homeTeam;
-                        document.getElementById('awayTeamName').textContent = f.awayTeam;
-                        document.getElementById('colLeftHeader').textContent = isHome ? '对手初始值' : '皇马初始值';
-                        document.getElementById('colRightHeader').textContent = isHome ? '皇马初始值' : '对手初始值';
-
-                        // 渲染已完成回合
-                        const tbody = document.getElementById('roundTableBody');
-                        tbody.innerHTML = '';
-                        matchState.logs.forEach((log, i) => {
-                            const round = i + 1;
-                            const isRmAttack = getRoundAttackSide(round);
-                            const badgeClass = isRmAttack ? 'attack-badge' : 'defense-badge';
-                            const badgeText = isRmAttack ? '皇马进攻' : '皇马防守';
-                            const tr = document.createElement('tr');
-                            tr.className = isRmAttack ? 'round-rm-row' : 'round-opp-row';
-                            if (isHome) {
-                                tr.innerHTML = `
-                                    <td style="font-weight:bold">${round}</td>
-                                    <td><span class="${badgeClass}">${badgeText}</span></td>
-                                    <td>${log.oppBefore || 0}</td>
-                                    <td><input type="number" class="round-input-cell" value="${log.input || 0}" disabled></td>
-                                    <td>${log.rmBefore || 0}</td>
-                                `;
-                            } else {
-                                tr.innerHTML = `
-                                    <td style="font-weight:bold">${round}</td>
-                                    <td><span class="${badgeClass}">${badgeText}</span></td>
-                                    <td>${log.rmBefore || 0}</td>
-                                    <td><input type="number" class="round-input-cell" value="${log.input || 0}" disabled></td>
-                                    <td>${log.oppBefore || 0}</td>
-                                `;
-                            }
-                            tbody.appendChild(tr);
-                        });
-
-                        // 恢复比分、日志、统计数据
-                        if (isHome) {
-                            document.getElementById('homeScore').textContent = matchState.rmScore;
-                            document.getElementById('awayScore').textContent = matchState.oppScore;
-                        } else {
-                            document.getElementById('homeScore').textContent = matchState.oppScore;
-                            document.getElementById('awayScore').textContent = matchState.rmScore;
-                        }
-                        updateLogTable();
-                        updateGoalRecords();
-                        updatePitchView();
-                        updateMiniStats();
-                        unlockMatchUI();
-                        document.getElementById('replayBtn').classList.remove('show');
-                        // 修正回合数偏移：草稿已保存待输入回合号，抵消appendNewRound内部的自增
-                        matchState.round--;
-                        appendNewRound();
-                        switchPage('match');
+                        // 全局统一调用恢复函数，确保回合号完全一致
+                        restoreMatchDraft(existingDraft);
                         return;
                     } else {
-                        // 用户选择不恢复，清除旧草稿
                         clearMatchDraft();
                     }
                 } else {
@@ -4492,51 +4409,16 @@
 
         // ===================== 比赛中途存档 =====================
         function saveMatchDraft() {
-            if (!currentMatch || currentMatch.finished) return;
-            // 深拷贝状态，排除计时器对象
+            if (!currentMatch) return;
             const draft = {
                 fixtureId: currentMatch.id,
-                isHome: isHome,
-                isNeutral: isNeutral,
-                matchState: {
-                    round: matchState.round,
-                    rmAcc: matchState.rmAcc,
-                    oppAcc: matchState.oppAcc,
-                    rmFloor: matchState.rmFloor,
-                    oppFloor: matchState.oppFloor,
-                    oppScore: matchState.oppScore,
-                    rmScore: matchState.rmScore,
-                    logs: [...matchState.logs],
-                    goals: [...matchState.goals],
-                    rmShots: matchState.rmShots,
-                    rmShotsOnTarget: matchState.rmShotsOnTarget,
-                    rmCorners: matchState.rmCorners,
-                    oppShots: matchState.oppShots,
-                    oppShotsOnTarget: matchState.oppShotsOnTarget,
-                    oppCorners: matchState.oppCorners
-                },
-                saveTime: Date.now()
+                matchState: JSON.parse(JSON.stringify(matchState)),
+                saveTime: Date.now() // 每次保存强制刷新时间戳
             };
             localStorage.setItem(MATCH_DRAFT_KEY, JSON.stringify(draft));
-
-            // 防抖上传：2秒内无新操作才真正上传，避免频繁调用 GitHub API
-            if (draftUploadTimer) clearTimeout(draftUploadTimer);
-            draftUploadTimer = setTimeout(async () => {
-                const cloudConfig = localStorage.getItem(CLOUD_CONFIG_KEY);
-                if (!cloudConfig) return;
-                
-                draftSyncStatus = 'uploading';
-                updateDraftSyncTip();
-                const ok = await uploadMatchDraftToCloud(true);
-                draftSyncStatus = ok ? 'success' : 'error';
-                updateDraftSyncTip();
-                
-                // 3秒后清除成功提示
-                if (ok) setTimeout(() => {
-                    draftSyncStatus = 'idle';
-                    updateDraftSyncTip();
-                }, 3000);
-            }, 2000);
+            
+            // 异步上传云端，不阻塞本地操作
+            uploadMatchDraftToCloud(draft).catch(e => console.warn('云端草稿上传失败:', e));
         }
 
         // 更新比赛页草稿同步状态提示
@@ -4653,33 +4535,35 @@
         }
 
         function restoreMatchDraft(draft) {
-            const f = seasonData.fixtures.find(x => x.id === draft.fixtureId);
-            if (!f || f.finished) {
-                clearMatchDraft();
-                return;
-            }
+            const f = seasonData.fixtures.find(item => item.id === draft.fixtureId);
+            if (!f) return;
 
             currentMatch = f;
-            isHome = draft.isHome;
-            isNeutral = draft.isNeutral;
+            isHome = f.isRmHome;
+            isNeutral = f.neutral || false;
 
-            // 恢复比赛状态，重置计时器相关属性
-            matchState = {
-                ...draft.matchState,
-                isReplaying: false,
-                replayTimer: null,
-                replayIndex: 0
-            };
+            // 深拷贝恢复比赛状态，避免引用污染
+            matchState = JSON.parse(JSON.stringify(draft.matchState));
+            matchState.isReplaying = false;
+            matchState.replayTimer = null;
+            matchState.replayIndex = 0;
+
+            // ========== 核心：强制以日志数为唯一基准，彻底杜绝回合号偏差 ==========
+            // 已完成回合数 = 日志条数，待输入回合号 = 已完成数 + 1
+            const completedCount = matchState.logs.length;
+            const nextRoundNum = completedCount + 1;
+            // round 代表「下一次 appendNewRound 生成的回合号」，直接设置为待输入回合号
+            matchState.round = nextRoundNum;
+            // ======================================================================
 
             // 应用主客场主题
             document.body.classList.remove('away-match', 'neutral-match');
             if (isNeutral) document.body.classList.add('neutral-match');
             else if (!isHome) document.body.classList.add('away-match');
 
-            // 更新比赛头部信息
+            // 更新头部信息
             document.getElementById('matchPageTitle').textContent = `${f.typeName} · ${f.round}${isNeutral ? ' · 中立场地' : ''}`;
             document.getElementById('matchTypeBadge').textContent = f.typeName;
-            
             const badge = document.getElementById('homeAwayBadge');
             if (isNeutral) {
                 badge.textContent = '中立场地';
@@ -4688,14 +4572,12 @@
                 badge.textContent = isHome ? '主场作战' : '客场作战';
                 badge.className = `home-away-badge ${isHome ? 'badge-home' : 'badge-away'}`;
             }
-            
             document.getElementById('homeTeamName').textContent = f.homeTeam;
             document.getElementById('awayTeamName').textContent = f.awayTeam;
-
             document.getElementById('colLeftHeader').textContent = isHome ? '对手初始值' : '皇马初始值';
             document.getElementById('colRightHeader').textContent = isHome ? '皇马初始值' : '对手初始值';
 
-            // 渲染已完成的回合
+            // 渲染所有已完成回合
             const tbody = document.getElementById('roundTableBody');
             tbody.innerHTML = '';
             matchState.logs.forEach((log, i) => {
@@ -4703,10 +4585,8 @@
                 const isRmAttack = getRoundAttackSide(round);
                 const badgeClass = isRmAttack ? 'attack-badge' : 'defense-badge';
                 const badgeText = isRmAttack ? '皇马进攻' : '皇马防守';
-
                 const tr = document.createElement('tr');
                 tr.className = isRmAttack ? 'round-rm-row' : 'round-opp-row';
-                
                 if (isHome) {
                     tr.innerHTML = `
                         <td style="font-weight:bold">${round}</td>
@@ -4735,20 +4615,16 @@
                 document.getElementById('homeScore').textContent = matchState.oppScore;
                 document.getElementById('awayScore').textContent = matchState.rmScore;
             }
-
             updateLogTable();
             updateGoalRecords();
             updatePitchView();
             updateMiniStats();
 
-            // 解锁操作，生成当前待输入回合输入框
-            unlockMatchUI();
-            document.getElementById('replayBtn').classList.remove('show');
-            // 修正回合数偏移：草稿已保存待输入回合号，抵消appendNewRound内部的自增
-            matchState.round--;
+            // 生成当前待输入的回合行
             appendNewRound();
 
-            // 自动跳转到比赛页
+            unlockMatchUI();
+            document.getElementById('replayBtn').classList.remove('show');
             switchPage('match');
         }
 
@@ -5004,8 +4880,9 @@
             updateGoalRecords();
             updatePitchView();
             updateMiniStats();
-            saveMatchDraft();
+            // 先生成下一回合输入行，再保存草稿，确保草稿状态与页面完全一致
             appendNewRound();
+            saveMatchDraft();
         }
 
         function generateGoalScorer() {
